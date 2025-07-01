@@ -44,12 +44,42 @@ from transformers.utils import ModelOutput
 
 try:  # v1
     from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked_func
+    from flash_attn.bert_padding import pad_input, unpad_input
+    FLASH_ATTN_AVAILABLE = True
 except ImportError:  # v2
-    from flash_attn.flash_attn_interface import (
-        flash_attn_varlen_qkvpacked_func as flash_attn_unpadded_qkvpacked_func,
-    )
-
-from flash_attn.bert_padding import pad_input, unpad_input
+    try:
+        from flash_attn.flash_attn_interface import (
+            flash_attn_varlen_qkvpacked_func as flash_attn_unpadded_qkvpacked_func,
+        )
+        from flash_attn.bert_padding import pad_input, unpad_input
+        FLASH_ATTN_AVAILABLE = True
+    except ImportError:
+        # Fallback implementations when flash_attn is not available
+        FLASH_ATTN_AVAILABLE = False
+        
+        def pad_input(hidden_states, indices, batch_size, seq_len):
+            """Pad hidden states to match the expected sequence length."""
+            # Create a tensor of zeros with the expected shape
+            padded_output = torch.zeros(
+                batch_size, seq_len, hidden_states.shape[-1],
+                dtype=hidden_states.dtype, device=hidden_states.device
+            )
+            # Fill in the non-padded values
+            padded_output[indices] = hidden_states
+            return padded_output
+        
+        def unpad_input(hidden_states, attention_mask):
+            """Remove padding from hidden states based on attention mask."""
+            # Get the indices of non-padded tokens
+            seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
+            indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
+            max_seqlen_in_batch = seqlens_in_batch.max().item()
+            cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
+            
+            # Extract non-padded hidden states
+            hidden_states = hidden_states[attention_mask.bool()]
+            
+            return hidden_states, indices, cu_seqlens, max_seqlen_in_batch
 
 
 class FlashAttention(nn.Module):
@@ -85,17 +115,50 @@ class FlashAttention(nn.Module):
             key_padding_mask: a bool tensor of shape (B, S)
         """
         assert not need_weights
-        assert qkv.dtype in [torch.float16, torch.bfloat16]
-        assert qkv.is_cuda
-        if cu_seqlens is None:
-            batch_size = qkv.shape[0]
-            seqlen = qkv.shape[1]
-            if key_padding_mask is None:
-                qkv = rearrange(qkv, "b s ... -> (b s) ...")
-                max_s = seqlen
-                cu_seqlens = torch.arange(
-                    0, (batch_size + 1) * seqlen, step=seqlen, dtype=torch.int32, device=qkv.device
-                )
+        
+        if FLASH_ATTN_AVAILABLE:
+            assert qkv.dtype in [torch.float16, torch.bfloat16]
+            assert qkv.is_cuda
+            if cu_seqlens is None:
+                batch_size = qkv.shape[0]
+                seqlen = qkv.shape[1]
+                if key_padding_mask is None:
+                    qkv = rearrange(qkv, "b s ... -> (b s) ...")
+                    max_s = seqlen
+                    cu_seqlens = torch.arange(
+                        0, (batch_size + 1) * seqlen, step=seqlen, dtype=torch.int32, device=qkv.device
+                    )
+                    output = flash_attn_unpadded_qkvpacked_func(
+                        qkv,
+                        cu_seqlens,
+                        max_s,
+                        self.dropout_p if self.training else 0.0,
+                        softmax_scale=self.softmax_scale,
+                        causal=causal,
+                    )
+                    output = rearrange(output, "(b s) ... -> b s ...", b=batch_size)
+                else:
+                    nheads = qkv.shape[-2]
+                    x = rearrange(qkv, "b s three h d -> b s (three h d)")
+                    x_unpad, indices, cu_seqlens, max_s = unpad_input(x, key_padding_mask)
+                    x_unpad = rearrange(x_unpad, "nnz (three h d) -> nnz three h d", three=3, h=nheads)
+                    output_unpad = flash_attn_unpadded_qkvpacked_func(
+                        x_unpad,
+                        cu_seqlens,
+                        max_s,
+                        self.dropout_p if self.training else 0.0,
+                        softmax_scale=self.softmax_scale,
+                        causal=causal,
+                    )
+                    output = rearrange(
+                        pad_input(
+                            rearrange(output_unpad, "nnz h d -> nnz (h d)"), indices, batch_size, seqlen
+                        ),
+                        "b s (h d) -> b s h d",
+                        h=nheads,
+                    )
+            else:
+                assert max_s is not None
                 output = flash_attn_unpadded_qkvpacked_func(
                     qkv,
                     cu_seqlens,
@@ -104,37 +167,40 @@ class FlashAttention(nn.Module):
                     softmax_scale=self.softmax_scale,
                     causal=causal,
                 )
-                output = rearrange(output, "(b s) ... -> b s ...", b=batch_size)
-            else:
-                nheads = qkv.shape[-2]
-                x = rearrange(qkv, "b s three h d -> b s (three h d)")
-                x_unpad, indices, cu_seqlens, max_s = unpad_input(x, key_padding_mask)
-                x_unpad = rearrange(x_unpad, "nnz (three h d) -> nnz three h d", three=3, h=nheads)
-                output_unpad = flash_attn_unpadded_qkvpacked_func(
-                    x_unpad,
-                    cu_seqlens,
-                    max_s,
-                    self.dropout_p if self.training else 0.0,
-                    softmax_scale=self.softmax_scale,
-                    causal=causal,
-                )
-                output = rearrange(
-                    pad_input(
-                        rearrange(output_unpad, "nnz h d -> nnz (h d)"), indices, batch_size, seqlen
-                    ),
-                    "b s (h d) -> b s h d",
-                    h=nheads,
-                )
         else:
-            assert max_s is not None
-            output = flash_attn_unpadded_qkvpacked_func(
-                qkv,
-                cu_seqlens,
-                max_s,
-                self.dropout_p if self.training else 0.0,
-                softmax_scale=self.softmax_scale,
-                causal=causal,
-            )
+            # Fallback to standard attention when flash attention is not available
+            batch_size, seqlen, three, nheads, head_dim = qkv.shape
+            qkv = qkv.permute(0, 2, 1, 3, 4)  # [B, 3, N, num_heads, head_dim]
+            q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]  # [B, N, num_heads, head_dim]
+            
+            # Reshape for attention computation
+            q = q.transpose(1, 2)  # [B, num_heads, N, head_dim]
+            k = k.transpose(1, 2)  # [B, num_heads, N, head_dim]
+            v = v.transpose(1, 2)  # [B, num_heads, N, head_dim]
+            
+            # Compute attention scores
+            scale = self.softmax_scale or (head_dim ** -0.5)
+            attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
+            
+            if key_padding_mask is not None:
+                # Apply padding mask
+                key_padding_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, N]
+                attn_weights = attn_weights.masked_fill(key_padding_mask, float('-inf'))
+            
+            if causal:
+                # Apply causal mask
+                causal_mask = torch.triu(torch.ones(seqlen, seqlen, device=qkv.device), diagonal=1)
+                causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, N, N]
+                attn_weights = attn_weights.masked_fill(causal_mask.bool(), float('-inf'))
+            
+            # Apply softmax and dropout
+            attn_weights = F.softmax(attn_weights, dim=-1)
+            if self.training and self.dropout_p > 0:
+                attn_weights = F.dropout(attn_weights, p=self.dropout_p)
+            
+            # Apply attention to values
+            output = torch.matmul(attn_weights, v)  # [B, num_heads, N, head_dim]
+            output = output.transpose(1, 2)  # [B, N, num_heads, head_dim]
 
         return output, None
 
@@ -160,19 +226,25 @@ def _flash_attn(self, x: torch.Tensor) -> torch.Tensor:
 
 
 def forward(self, x: torch.Tensor) -> torch.Tensor:
-    assert (
-        x.dtype == torch.bfloat16
-    ), "Flash attention is only supported on A100 or H100 GPU during training due to head dim > 64 backward."
+    if FLASH_ATTN_AVAILABLE:
+        assert (
+            x.dtype == torch.bfloat16
+        ), "Flash attention is only supported on A100 or H100 GPU during training due to head dim > 64 backward."
     result = self._flash_attn(x)
     return result
 
 
 def replace_vit_attn_with_flash_attn():
-    cuda_major, cuda_minor = torch.cuda.get_device_capability()
-    if cuda_major < 8:
+    if FLASH_ATTN_AVAILABLE:
+        cuda_major, cuda_minor = torch.cuda.get_device_capability()
+        if cuda_major < 8:
+            warnings.warn(
+                "Flash attention is only supported on A100 or H100 GPU during training due to head dim > 64 backward."
+                "ref: https://github.com/HazyResearch/flash-attention/issues/190#issuecomment-1523359593"
+            )
+    else:
         warnings.warn(
-            "Flash attention is only supported on A100 or H100 GPU during training due to head dim > 64 backward."
-            "ref: https://github.com/HazyResearch/flash-attention/issues/190#issuecomment-1523359593"
+            "Flash attention not available, using standard attention as fallback."
         )
 
     Attention.forward = forward

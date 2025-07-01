@@ -71,18 +71,19 @@ from lerobot.common.utils.utils import (
 # User can just move this single python class method gr00t/eval/service.py
 # to their code or do the following line below
 # sys.path.append(os.path.expanduser("~/Isaac-GR00T/gr00t/eval/"))
-from service import ExternalRobotInferenceClient
+# from service import ExternalRobotInferenceClient
 
-# from gr00t.eval.service import ExternalRobotInferenceClient
+from gr00t.eval.service import ExternalRobotInferenceClient
 
 #################################################################################
 
 
 class Gr00tRobotInferenceClient:
-    """The exact keys used is defined in modality.json
+    """Client for Gr00T policy inference with robot integration
 
     This currently only supports so100_follower, so101_follower
-    modify this code to support other robots with other keys based on modality.json
+    The model expects video.webcam key, so camera keys are mapped accordingly.
+    Modify this code to support other robots with other keys based on modality.json
     """
 
     def __init__(
@@ -103,9 +104,17 @@ class Gr00tRobotInferenceClient:
         self.modality_keys = ["single_arm", "gripper"]
 
     def get_action(self, observation_dict, lang: str):
-        # first add the images
-        obs_dict = {f"video.{key}": observation_dict[key] for key in self.camera_keys}
-
+        # Map camera keys to the expected video.webcam key
+        # The model was trained with single camera configuration expecting video.webcam
+        # but your robot provides video.front and video.wrist
+        obs_dict = {}
+        
+        # Use the first camera as the main camera (webcam)
+        if self.camera_keys:
+            main_camera_key = self.camera_keys[0]  # Use first camera (e.g., 'front')
+            print(f"Using camera '{main_camera_key}' as video.webcam for Gr00T model")
+            obs_dict["video.webcam"] = observation_dict[main_camera_key]
+        
         # show images
         if self.show_images:
             view_img(obs_dict)
@@ -126,11 +135,10 @@ class Gr00tRobotInferenceClient:
         # get the action chunk via the policy server
         # Example of obs_dict for single camera task:
         # obs_dict = {
-        #     "video.front": np.zeros((1, 480, 640, 3), dtype=np.uint8),
-        #     "video.wrist": np.zeros((1, 480, 640, 3), dtype=np.uint8),
+        #     "video.webcam": np.zeros((1, 480, 640, 3), dtype=np.uint8),
         #     "state.single_arm": np.zeros((1, 5)),
         #     "state.gripper": np.zeros((1, 1)),
-        #     "annotation.human.action.task_description": [self.language_instruction],
+        #     "annotation.human.task_description": [self.language_instruction],
         # }
         action_chunk = self.policy.get_action(obs_dict)
 
